@@ -37,6 +37,7 @@ import {
   smtpCaptureService,
   wordpressSmtpCaptureMuPlugin,
 } from "./smtp-capture-helpers";
+import { MYSQL_BENCHMARK_PHP } from "../../../apps/browser-demos/lib/init/mysql-benchmark";
 
 const REPO_ROOT = findRepoRoot();
 const BROWSER_DIR = join(REPO_ROOT, "apps", "browser-demos");
@@ -67,14 +68,16 @@ const COREUTILS_PATH = resolveBinary("programs/coreutils.wasm");
 const MSMTPD_PATH = resolveBinary("programs/msmtpd.wasm");
 const OUT_FILE = join(BROWSER_DIR, "public", "lamp.vfs.zst");
 const PHP_FPM_WORKERS = 6;
+const MARIADB_SOCKET_PATH = "/tmp/mysql.sock";
 
 // LAMP-specific data dirs that mariadbd writes to at runtime. The image
 // intentionally bakes only a minimal /bin/sh + sleep environment for the
 // bootstrap script, not the full shell demo toolset.
 function populateMariadbDataDirs(fs: MemoryFileSystem): void {
-  for (const dir of ["/data", "/data/mysql", "/data/tmp", "/data/test"]) {
+  for (const dir of ["/data", "/data/mysql", "/data/tmp", "/data/test", "/tmp"]) {
     ensureDirRecursive(fs, dir);
   }
+  fs.chmod("/tmp", 0o1777);
 }
 
 function populateBootstrapShell(fs: MemoryFileSystem): void {
@@ -218,6 +221,8 @@ request_slowlog_trace_depth = 0
 
 curl.cainfo=/etc/ssl/certs/ca-certificates.crt
 openssl.cafile=/etc/ssl/certs/ca-certificates.crt
+mysqli.default_socket=${MARIADB_SOCKET_PATH}
+pdo_mysql.default_socket=${MARIADB_SOCKET_PATH}
 
 [opcache]
 opcache.enable=1
@@ -322,7 +327,7 @@ const WP_CONFIG_TEMPLATE_PHP = `<?php
 define('DB_NAME', 'wordpress');
 define('DB_USER', 'root');
 define('DB_PASSWORD', '');
-define('DB_HOST', '127.0.0.1:3306');
+define('DB_HOST', 'localhost');
 define('DB_CHARSET', 'utf8');
 define('DB_COLLATE', '');
 
@@ -383,7 +388,7 @@ function buildServices(): DinitService[] {
         "--datadir=/data --tmpdir=/data/tmp --default-storage-engine=Aria " +
         "--skip-grant-tables --key-buffer-size=1048576 --table-open-cache=10 " +
         "--sort-buffer-size=262144 --skip-networking=0 --port=3306 " +
-        "--bind-address=0.0.0.0 --socket= --max-connections=10 " +
+        `--bind-address=0.0.0.0 --socket=${MARIADB_SOCKET_PATH} --max-connections=10 ` +
         "--thread-handling=no-threads --log-error=/data/error.log " +
         // --init-file runs after the daemon is ready — guarantees the
         // wordpress DB exists even if the bootstrap timeout-and-kill
@@ -461,6 +466,7 @@ async function main() {
   writeVfsFile(fs, "/etc/wp-config-init.sh", WP_CONFIG_INIT_SCRIPT);
   ensureDirRecursive(fs, "/var/www/html");
   writeVfsFile(fs, "/var/www/html/wp-config.php", renderWpConfig("/app", "http"));
+  writeVfsFile(fs, "/var/www/html/kandelo-mysql-bench.php", MYSQL_BENCHMARK_PHP);
 
   // WordPress-specific dirs + mu-plugin
   ensureDirRecursive(fs, "/var/www/html/wp-content/mu-plugins");
