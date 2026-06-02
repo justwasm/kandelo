@@ -5524,18 +5524,35 @@ export class CentralizedKernelWorker {
 
     const parentPid = channel.pid;
     // Skip pids that are already registered (e.g., pid 3 is nginx master)
-    while (this.processes.has(this.nextChildPid)) {
-      this.nextChildPid++;
-    }
-    const childPid = this.nextChildPid++;
+    // or are still zombie in the kernel's process table (EEXIST from
+    // kernel_fork_process). Without this loop, a top-level process that
+    // exits (e.g. pid 100) is removed from this.processes by
+    // deactivateProcess but remains as a zombie in the kernel's table.
+    // The next fork that reuses pid 100 would then fail with EEXIST.
+    let childPid: number | undefined;
+    for (let attempt = 0; attempt < 10_000; attempt++) {
+      while (this.processes.has(this.nextChildPid)) {
+        this.nextChildPid++;
+      }
+      const candidatePid = this.nextChildPid++;
 
-    // Clone the Process in the kernel's ProcessTable
-    const kernelForkProcess = this.kernelInstance!.exports.kernel_fork_process as
-      (parentPid: number, childPid: number) => number;
-    const forkResult = kernelForkProcess(parentPid, childPid);
-    if (forkResult < 0) {
-      // Fork failed in kernel (e.g., ESRCH, ENOMEM)
-      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, (-forkResult) >>> 0);
+      // Clone the Process in the kernel's ProcessTable
+      const kernelForkProcess = this.kernelInstance!.exports.kernel_fork_process as
+        (parentPid: number, childPid: number) => number;
+      const forkResult = kernelForkProcess(parentPid, candidatePid);
+      if (forkResult >= 0) {
+        childPid = candidatePid;
+        break;
+      }
+      if (forkResult !== -17) { // not EEXIST
+        // Real error (e.g., ESRCH, ENOMEM)
+        this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, (-forkResult) >>> 0);
+        return;
+      }
+      // EEXIST: kernel still has a zombie at this pid, try next.
+    }
+    if (childPid === undefined) {
+      this.completeChannel(channel, SYS_FORK, _origArgs, undefined, -1, 11 /* EAGAIN */);
       return;
     }
 

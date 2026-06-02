@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tmux Test — Kandelo</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: #1e1e1e; color: #d4d4d4; font-family: sans-serif; }
+#terminal { height: 100%; padding: 4px; }
+#status.fixed { position: fixed; bottom: 0; left: 0; right: 0; padding: 6px 12px;
+  font: 12px/1.4 monospace; background: #2d2d2d; border-top: 1px solid #444; z-index: 10; }
+#status.ok { color: #4ec9b0; }
+#status.err { color: #f48771; }
+#status.info { color: #888; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<div id="status" class="fixed">initialising...</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm",
+    "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm"
+  }
+}
+</script>
+
+<script type="module">
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import kernelWasmUrl from '@kernel-wasm?url';
+import tmuxWasmUrl from '@binaries/programs/wasm32/tmux.wasm?url';
+import bashWasmUrl from '@binaries/programs/wasm32/bash.wasm?url';
+import { BrowserKernel } from '@host/browser-kernel-host';
+import { MemoryFileSystem } from '@host/vfs/memory-fs';
+
+const encoder = new TextEncoder();
+const $s = (msg, cls = 'info') => {
+  const el = document.getElementById('status');
+  el.textContent = msg; el.className = 'fixed ' + cls;
+};
+
+async function main() {
+  $s('fetching kernel.wasm...');
+  const kernelBytes = await fetch(kernelWasmUrl).then(r => r.arrayBuffer());
+
+  /* Minimal VFS with /tmp and /home/user */
+  const memfs = MemoryFileSystem.create(new SharedArrayBuffer(32 * 1024 * 1024));
+  const { writeVfsBinary } = await import('./lib/init/vfs-utils');
+  // Create directories explicitly (no try/catch to surface real errors)
+  memfs.mkdir('/usr', 0o755);
+  memfs.mkdir('/usr/bin', 0o755);
+  memfs.mkdir('/bin', 0o755);
+  memfs.mkdir('/tmp', 0o1777);
+  memfs.mkdir('/home', 0o755);
+  memfs.mkdir('/home/user', 0o755);
+
+  $s('fetching tmux.wasm...');
+  const tmuxBytes = await fetch(tmuxWasmUrl).then(r => r.arrayBuffer());
+  writeVfsBinary(memfs, '/usr/bin/tmux', new Uint8Array(tmuxBytes));
+
+  /* Add bash so tmux can spawn shells in windows */
+  $s('fetching bash.wasm...');
+  const bashBytes = await fetch(bashWasmUrl).then(r => r.arrayBuffer());
+  writeVfsBinary(memfs, '/bin/bash', new Uint8Array(bashBytes));
+  try { memfs.symlink('/bin/bash', '/bin/sh'); } catch {}
+  try { memfs.symlink('/bin/bash', '/usr/bin/bash'); } catch {}
+  try { memfs.symlink('/bin/bash', '/usr/bin/sh'); } catch {}
+
+  const kernel = new BrowserKernel({ memfs, maxWorkers: 4 });
+  $s('instantiating kernel...');
+  await kernel.init(kernelBytes);
+
+  /* ── Terminal ── */
+  const term = new Terminal({
+    cursorBlink: true, fontSize: 14,
+    fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
+    theme: { background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#d4d4d4' },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('terminal'));
+  fit.fit();
+
+  /* ── Spawn tmux -V first to verify binary works ── */
+  $s('spawning tmux -V...');
+  const exit1 = kernel.spawn(tmuxBytes, ['tmux', '-V'], {
+    env: [], cwd: '/tmp', uid: 1000, gid: 1000,
+    pty: true, ptyCols: term.cols, ptyRows: term.rows,
+  });
+  let pid1 = kernel.nextPid - 1;
+  let output1 = '';
+  kernel.onPtyOutput(pid1, (data) => { output1 += data; term.write(data); });
+  const code1 = await exit1;
+  $s(`tmux -V: ${output1.trim()}`, code1 === 0 ? 'ok' : 'err');
+
+  /* Try different tmux commands to see where it blocks */
+  const tests = [
+    ['list-sessions', ['tmux', 'list-sessions']],
+  ];
+  for (const [label, argv] of tests) {
+    term.write(`\r\n\x1b[33m--- ${label} ---\x1b[0m\r\n`);
+    const exitP = kernel.spawn(tmuxBytes, argv, {
+      env: ['HOME=/home/user', 'TERM=xterm-256color', 'USER=user'],
+      cwd: '/home/user', uid: 1000, gid: 1000,
+      pty: true, ptyCols: 80, ptyRows: 24,
+    });
+    const pid = kernel.nextPid - 1;
+    kernel.onPtyOutput(pid, (data) => term.write(data));
+    try {
+      const code = await Promise.race([
+        exitP,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+      ]);
+      term.write(`\r\n\x1b[33m[exit ${code}]\x1b[0m\r\n`);
+    } catch (e) {
+      term.write(`\r\n\x1b[31m[${e}]\x1b[0m\r\n`);
+    }
+  }
+
+  /* ── Start tmux server in background (via spawn+detach) ── */
+  /* Strategy: start server with -D, then run client commands in separate processes */
+
+  /* Step 1: start-server (exits immediately after starting daemon... but we use direct path) */
+  /* Actually let's just run new-session -d and see if it connects to the server started in a separate spawn */
+
+  /* Run: start the server directly (no fork needed) */
+  term.write(`\r\n\x1b[33m--- tmux -L test new-session -d -s test ---\x1b[0m\r\n`);
+  $s('spawning tmux new-session -d...');
+  const exitNS = kernel.spawn(tmuxBytes, ['tmux', '-L', 'test', 'new-session', '-d', '-s', 'test'], {
+    env: ['HOME=/home/user', 'TERM=xterm-256color', 'USER=user',
+          'SHELL=/bin/bash', 'PATH=/usr/local/bin:/usr/bin:/bin:/sbin'],
+    cwd: '/home/user', uid: 1000, gid: 1000,
+    pty: true, ptyCols: 80, ptyRows: 24,
+  });
+  let pidNS = kernel.nextPid - 1;
+  kernel.onPtyOutput(pidNS, (data) => term.write(data));
+  try {
+    const code = await Promise.race([
+      exitNS,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout (10s)')), 10000)),
+    ]);
+    term.write(`\r\n\x1b[33m[new-session exit ${code}]\x1b[0m\r\n`);
+    $s(`new-session done (code ${code})`, code === 0 ? 'ok' : 'err');
+  } catch (e) {
+    term.write(`\r\n\x1b[31m[${e}]\x1b[0m\r\n`);
+    $s('new-session timed out', 'err');
+  }
+}
+
+main().catch(err => { $s(err.message, 'err'); console.error(err); });
+</script>
+</body>
+</html>
