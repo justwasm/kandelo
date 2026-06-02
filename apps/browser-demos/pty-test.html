@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PTY Test — Kandelo</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: #1e1e1e; color: #d4d4d4; font-family: sans-serif; }
+#terminal { height: 100%; padding: 4px; }
+#status { position: fixed; bottom: 0; left: 0; right: 0; padding: 6px 12px;
+  font: 12px/1.4 monospace; background: #2d2d2d; border-top: 1px solid #444; z-index: 10; }
+#status.ok { color: #4ec9b0; }
+#status.err { color: #f48771; }
+#status.info { color: #888; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<div id="status">initialising...</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm",
+    "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm"
+  }
+}
+</script>
+
+<script type="module">
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import kernelWasmUrl from '@kernel-wasm?url';
+import VFS_IMAGE_URL from '@binaries/programs/wasm32/shell.vfs.zst?url';
+import bashWasmUrl from '@binaries/programs/wasm32/bash.wasm?url';
+import { BrowserKernel } from '@host/browser-kernel-host';
+import { MemoryFileSystem } from '@host/vfs/memory-fs';
+import { rewriteShellLazyFileUrls } from './lib/init/shell-lazy-files';
+import { resolveShellLazyArchiveUrl } from './lib/init/lazy-archives';
+
+const encoder = new TextEncoder();
+const $s = (msg, cls = 'info') => {
+  document.getElementById('status').textContent = msg;
+  document.getElementById('status').className = cls;
+};
+
+async function main() {
+  $s('fetching kernel.wasm...');
+  const kernelBytes = await fetch(kernelWasmUrl).then(r => r.arrayBuffer());
+
+  $s('fetching shell VFS image...');
+  const vfsBytes = await fetch(VFS_IMAGE_URL).then(r => r.arrayBuffer());
+
+  $s(`${(kernelBytes.byteLength/1024).toFixed(0)} KiB kernel · ` +
+     `${(vfsBytes.byteLength/1024).toFixed(0)} KiB VFS`);
+
+  /* Restore VFS from image */
+  const memfs = MemoryFileSystem.fromImage(new Uint8Array(vfsBytes), {
+    maxByteLength: 128 * 1024 * 1024,
+  });
+  memfs.rewriteLazyArchiveUrls(resolveShellLazyArchiveUrl);
+  rewriteShellLazyFileUrls(memfs);
+
+  /* Create BrowserKernel (main-thread VFS path) */
+  const kernel = new BrowserKernel({ memfs, maxWorkers: 4 });
+  $s('instantiating kernel...');
+  await kernel.init(kernelBytes);
+
+  /* ── Terminal ── */
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
+    theme: { background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#d4d4d4' },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('terminal'));
+  fit.fit();
+
+  /* ── Stage bash in VFS ── */
+  $s('fetching bash.wasm...');
+  const bashBytes = await fetch(bashWasmUrl).then(r => r.arrayBuffer());
+  const { writeVfsBinary } = await import('./lib/init/vfs-utils');
+  writeVfsBinary(memfs, '/bin/bash', new Uint8Array(bashBytes));
+  try { memfs.symlink('/bin/bash', '/bin/sh'); } catch {}
+  try { memfs.symlink('/bin/bash', '/usr/bin/bash'); } catch {}
+  try { memfs.symlink('/bin/bash', '/usr/bin/sh'); } catch {}
+
+  /* ── Spawn bash with PTY ── */
+  $s('spawning bash (pty)...');
+
+  const exitPromise = kernel.spawn(bashBytes, ['bash', '-l', '-i'], {
+    env: ['HOME=/home/user', 'TERM=xterm-256color', 'USER=user',
+          'PATH=/usr/local/bin:/usr/bin:/bin:/sbin'],
+    cwd: '/home/user', uid: 1000, gid: 1000,
+    pty: true, ptyCols: term.cols, ptyRows: term.rows,
+  });
+
+  /* Find pid — kernel assigns after spawn starts */
+  const pid = (kernel.nextPid - 1);
+  $s(`bash pid=${pid} — ready`, 'ok');
+
+  /* Connect PTY output → terminal */
+  kernel.onPtyOutput(pid, (data) => { term.write(data); });
+
+  /* Connect terminal input → PTY master */
+  term.onData((data) => { kernel.ptyWrite(pid, encoder.encode(data)); });
+
+  /* Resize → SIGWINCH */
+  const ro = new ResizeObserver(() => {
+    fit.fit();
+    kernel.ptyResize(pid, term.cols, term.rows);
+  });
+  ro.observe(document.getElementById('terminal'));
+
+  const code = await exitPromise;
+  $s(`bash exited with code ${code}`, 'info');
+  term.write(`\r\n\x1b[33m[process exited with code ${code}]\x1b[0m\r\n`);
+}
+
+main().catch(err => {
+  $s(err.message, 'err');
+  console.error(err);
+});
+</script>
+</body>
+</html>

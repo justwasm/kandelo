@@ -413,6 +413,7 @@ export default defineConfig({
     devCorsProxyMiddleware(),
   ],
   server: {
+    allowedHosts: true,
     host: "127.0.0.1",
     port: preferredLocalPort,
     headers: crossOriginIsolationHeaders,
